@@ -1,0 +1,45 @@
+# API Keys
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Database
+*.db
+*.sqlite3
+
+# Uploads (user data)
+backend/uploads/
+
+# Logs
+backend/logs/
+
+# PaddleOCR model cache
+backend/paddle/
+
+# Generated reports
+backend/reports/
+
+# Compiled frontend (build artifacts)
+backend/static/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Debug files
+backend/static/test-image.html
+backend/static/debug-image.html

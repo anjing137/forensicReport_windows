@@ -1,0 +1,20 @@
+# Core web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+sqlalchemy==2.0.35
+pydantic==2.9.0
+python-multipart==0.0.12
+aiofiles==24.1.0
+
+# Word document generation
+python-docx==1.1.2
+
+# HTTP client (LLM API + Windows OCR backend)
+httpx==0.28.1
+
+# Image processing (OCR cropping)
+Pillow==10.4.0
+
+# OCR - Mac/Linux only, Windows uses oc33r.py (httpx-based API calls)
+# Install manually on Mac/Linux: pip install paddleocr==3.4.1
+paddleocr==3.4.1;sys_platform!="win32"
