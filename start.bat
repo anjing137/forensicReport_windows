@@ -8,7 +8,7 @@ echo   Forensic Report System
 echo ============================================================
 echo.
 
-:: Check Python
+::: Check Python
 if exist "%~dp0python\python.exe" (
     set "PYTHON=%~dp0python\python.exe"
     echo [OK] Using embedded Python
@@ -32,13 +32,13 @@ if exist "%~dp0python\python.exe" (
     )
 )
 
-:: Show Python version
+::: Show Python version
 echo.
 echo Python version:
 "!PYTHON!" --version
 echo.
 
-:: Install dependencies (pip skips already-installed packages)
+::: Install dependencies (pip skips already-installed packages)
 echo [INFO] Installing/verifying dependencies...
 "!PYTHON!" -m pip install -r "%~dp0backend\requirements.txt" -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
 if !errorlevel! neq 0 (
@@ -54,17 +54,32 @@ if !errorlevel! neq 0 (
 echo [OK] Dependencies ready
 echo.
 
-:: Set environment
+::: Activate paddle virtual environment
+set "VENV_SCRIPTS=%~dp0backend\paddle\Scripts"
+if exist "%VENV_SCRIPTS%\activate.bat" (
+    echo [OK] Activating paddle virtual environment...
+    call "%VENV_SCRIPTS%\activate.bat"
+    if !errorlevel! neq 0 (
+        echo [ERROR] Failed to activate virtual environment.
+        pause
+        exit /b 1
+    )
+) else (
+    echo [WARN] Virtual environment not found at %VENV_SCRIPTS%
+    echo [WARN] Using system Python instead.
+)
+
+::: Set environment
 set PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
-:: Start server
+::: Start server
 echo [*] Starting server...
 echo [*] Open browser: http://localhost:8000
 echo [*] Press Ctrl+C to stop
 echo.
 
 cd /d "%~dp0backend"
-"!PYTHON!" -m uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 echo.
 echo [INFO] Server stopped.

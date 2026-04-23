@@ -1,5 +1,5 @@
 """
-材料管理路由 - 支持按类型上传、按医院分组
+材料管理路由 - 支持按类型上传、按医院分组、PDF上传转图片
 """
 import os
 import shutil
@@ -62,7 +62,10 @@ def group_to_response(g: MaterialGroup) -> MaterialGroupResponse:
 
 @router.post("/groups", response_model=MaterialGroupResponse)
 def create_group(data: MaterialGroupCreate, db: Session = Depends(get_db)):
-    """创建材料分组（如：新乡市中心医院病历）"""
+    """创建材料分组（如：新乡市中心医院病历）
+
+    如果是病历或影像学报告，会自动创建配对的分组（病历↔影像学报告共用医院组名）
+    """
     # 自动计算 sort_order
     max_order = db.query(MaterialGroup).filter(
         MaterialGroup.case_id == data.case_id,
@@ -78,6 +81,37 @@ def create_group(data: MaterialGroupCreate, db: Session = Depends(get_db)):
     db.add(group)
     db.commit()
     db.refresh(group)
+
+    # 如果是病历或影像学报告，自动创建配对的分组
+    paired_type = None
+    if data.material_type == MaterialType.MEDICAL_RECORD:
+        paired_type = MaterialType.IMAGING_REPORT
+    elif data.material_type == MaterialType.IMAGING_REPORT:
+        paired_type = MaterialType.MEDICAL_RECORD
+
+    if paired_type:
+        # 检查配对分组是否已存在
+        existing_pair = db.query(MaterialGroup).filter(
+            MaterialGroup.case_id == data.case_id,
+            MaterialGroup.material_type == paired_type,
+            MaterialGroup.group_name == data.group_name
+        ).first()
+
+        if not existing_pair:
+            max_order_pair = db.query(MaterialGroup).filter(
+                MaterialGroup.case_id == data.case_id,
+                MaterialGroup.material_type == paired_type
+            ).count()
+
+            paired_group = MaterialGroup(
+                case_id=data.case_id,
+                material_type=paired_type,
+                group_name=data.group_name,
+                sort_order=max_order_pair + 1,
+            )
+            db.add(paired_group)
+            db.commit()
+
     return group_to_response(group)
 
 
@@ -329,3 +363,321 @@ def update_ocr_text(material_id: int, data: dict = Body(...), db: Session = Depe
     material.ocr_status = OcrStatus.COMPLETED
     db.commit()
     return {"ok": True}
+
+
+# ==================== PDF 转换 API ====================
+
+@router.post("/upload-pdf/{case_id}")
+async def upload_and_convert_pdf(
+    case_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    上传 PDF 文件并转换为 PNG 图片
+    - 保存 PDF 文件
+    - 调用 PyMuPDF (fitz) 转换为 PNG
+    - 返回转换后的页面列表
+    """
+    from app.utils.pdf_converter import PdfConverter
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "只支持 PDF 文件")
+
+    # 保存 PDF 文件
+    case_dir = os.path.join(UPLOAD_DIR, str(case_id))
+    os.makedirs(case_dir, exist_ok=True)
+
+    pdf_filename = file.filename
+    pdf_path = os.path.join(case_dir, pdf_filename)
+
+    with open(pdf_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # 转换为 PNG
+    converter = PdfConverter(case_id)
+    success, pages, error_msg = converter.convert(pdf_path, original_filename=pdf_filename)
+
+    if not success:
+        # 清理上传的 PDF
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        raise HTTPException(500, f"PDF 转换失败: {error_msg}")
+
+    # 统一 file_path 中的斜杠方向
+    for p in pages:
+        if p.get("filepath"):
+            p["filepath"] = p["filepath"].replace("\\", "/")
+
+    return {
+        "pdf_filename": pdf_filename,
+        "pdf_path": pdf_path.replace("\\", "/"),
+        "pages": pages,
+        "total_pages": len(pages)
+    }
+
+
+@router.get("/case/{case_id}/pdf-pages")
+def get_pdf_pages(case_id: int, db: Session = Depends(get_db)):
+    """
+    获取案件的所有 PDF 转换页面（未导入的）
+    同时返回已导入的页面信息（来自 Material 表）
+    """
+    from app.utils.pdf_converter import PdfConverter
+
+    converter = PdfConverter(case_id)
+    all_pages = converter.list_pages()
+
+    # 统一斜杠方向
+    for p in all_pages:
+        if p.get("filepath"):
+            p["filepath"] = p["filepath"].replace("\\", "/")
+
+    # 查找已导入到 Material 的页面
+    existing_materials = db.query(Material).filter(
+        Material.case_id == case_id,
+        Material.file_path.like(f"%pdf_pages/%")
+    ).all()
+
+    imported_filenames = {m.original_filename: m for m in existing_materials}
+
+    result = []
+    for p in all_pages:
+        filename = p["filename"]
+        material_info = imported_filenames.get(filename)
+
+        if material_info:
+            result.append({
+                **p,
+                "imported": True,
+                "material_id": material_info.id,
+                "material_type": material_info.material_type,
+                "material_type_label": get_material_type_label(material_info.material_type),
+                "group_id": material_info.group_id,
+                "description": material_info.description,
+            })
+        else:
+            result.append({
+                **p,
+                "imported": False,
+                "material_id": None,
+                "material_type": None,
+                "material_type_label": None,
+                "group_id": None,
+                "description": None,
+            })
+
+    return result
+
+
+@router.delete("/pdf-page/{case_id}/{filename}")
+def delete_pdf_page(case_id: int, filename: str, db: Session = Depends(get_db)):
+    """删除 PDF 转换后的单个页面文件"""
+    from app.utils.pdf_converter import PdfConverter
+
+    # 检查是否有已导入的 Material
+    existing = db.query(Material).filter(
+        Material.case_id == case_id,
+        Material.file_path.like(f"%pdf_pages/{filename}")
+    ).first()
+
+    if existing:
+        raise HTTPException(400, "该页面已导入材料，请先撤销导入后再删除")
+
+    converter = PdfConverter(case_id)
+    success, msg = converter.delete_page(filename)
+
+    if not success:
+        raise HTTPException(404, msg)
+
+    return {"ok": True, "message": msg}
+
+
+@router.delete("/pdf/{case_id}/{prefix}")
+def delete_pdf_all(case_id: int, prefix: str, db: Session = Depends(get_db)):
+    """
+    删除整个 PDF 的所有转换页面文件
+    - prefix: PDF 文件名前缀（如 case123_abc）
+    - 同时删除原始 PDF 文件（如果存在）
+    """
+    from app.utils.pdf_converter import PdfConverter
+
+    converter = PdfConverter(case_id)
+
+    # 删除所有转换的页面文件
+    deleted_count = 0
+    for f in os.listdir(converter.output_dir):
+        if f.startswith(prefix) and (f.endswith(".png") or f.endswith(".jpg")):
+            filepath = os.path.join(converter.output_dir, f)
+            if os.path.isfile(filepath):
+                os.remove(filepath)
+                deleted_count += 1
+
+    # 删除原始 PDF 文件（如果存在）
+    pdf_file = os.path.join(UPLOAD_DIR, str(case_id), prefix + ".pdf")
+    original_pdf_deleted = False
+    if os.path.exists(pdf_file):
+        os.remove(pdf_file)
+        original_pdf_deleted = True
+
+    return {
+        "ok": True,
+        "message": f"已删除 PDF {prefix} 的 {deleted_count} 个页面文件" + (" 和原始 PDF 文件" if original_pdf_deleted else ""),
+        "deleted_pages": deleted_count,
+        "deleted_original_pdf": original_pdf_deleted
+    }
+
+
+@router.post("/import-pdf-pages/{case_id}")
+def import_pdf_pages(
+    case_id: int,
+    filenames: List[str] = Body(...),
+    material_type: str = Body(...),
+    group_id: int = Body(None),
+    group_name: str = Body(None),  # 可选：同时创建新分组
+    db: Session = Depends(get_db),
+):
+    """
+    将 PDF 转换页面导入为材料
+
+    - filenames: 要导入的页面文件名列表
+    - material_type: 材料类型
+    - group_id: 分组ID（病历/影像需要）
+    - group_name: 如果没有 group_id，可以传这个来创建新分组
+    """
+    from app.utils.pdf_converter import PdfConverter
+
+    if material_type not in MaterialType.ALL:
+        raise HTTPException(400, f"无效的材料类型: {material_type}")
+
+    # 如果需要分组但没有 group_id，先创建分组
+    if group_id is None and group_name and material_type in [MaterialType.MEDICAL_RECORD, MaterialType.IMAGING_REPORT]:
+        # 检查是否已存在同名分组
+        existing = db.query(MaterialGroup).filter(
+            MaterialGroup.case_id == case_id,
+            MaterialGroup.material_type == material_type,
+            MaterialGroup.group_name == group_name
+        ).first()
+
+        if existing:
+            group_id = existing.id
+        else:
+            max_order = db.query(MaterialGroup).filter(
+                MaterialGroup.case_id == case_id,
+                MaterialGroup.material_type == material_type
+            ).count()
+
+            new_group = MaterialGroup(
+                case_id=case_id,
+                material_type=material_type,
+                group_name=group_name,
+                sort_order=max_order + 1,
+            )
+            db.add(new_group)
+            db.commit()
+            db.refresh(new_group)
+            group_id = new_group.id
+
+            # 自动创建配对分组
+            paired_type = None
+            if material_type == MaterialType.MEDICAL_RECORD:
+                paired_type = MaterialType.IMAGING_REPORT
+            elif material_type == MaterialType.IMAGING_REPORT:
+                paired_type = MaterialType.MEDICAL_RECORD
+
+            if paired_type:
+                existing_pair = db.query(MaterialGroup).filter(
+                    MaterialGroup.case_id == case_id,
+                    MaterialGroup.material_type == paired_type,
+                    MaterialGroup.group_name == group_name
+                ).first()
+                if not existing_pair:
+                    max_order_pair = db.query(MaterialGroup).filter(
+                        MaterialGroup.case_id == case_id,
+                        MaterialGroup.material_type == paired_type
+                    ).count()
+                    paired_group = MaterialGroup(
+                        case_id=case_id,
+                        material_type=paired_type,
+                        group_name=group_name,
+                        sort_order=max_order_pair + 1,
+                    )
+                    db.add(paired_group)
+                    db.commit()
+
+    converter = PdfConverter(case_id)
+    results = []
+
+    # 计算起始页码
+    existing_count = 0
+    if group_id:
+        existing_count = db.query(Material).filter(Material.group_id == group_id).count()
+
+    for idx, filename in enumerate(filenames):
+        page_path = os.path.join(converter.output_dir, filename)
+
+        if not os.path.exists(page_path):
+            results.append({"filename": filename, "success": False, "error": f"文件不存在: {page_path}"})
+            continue
+
+        page_number = (existing_count + idx + 1) if group_id else None
+
+        # 检查是否已导入
+        existing = db.query(Material).filter(
+            Material.case_id == case_id,
+            Material.file_path.like(f"%pdf_pages/{filename}")
+        ).first()
+
+        if existing:
+            results.append({"filename": filename, "success": False, "error": "该页面已导入"})
+            continue
+
+        try:
+            material = Material(
+                case_id=case_id,
+                group_id=group_id,
+                material_type=material_type,
+                description=filename,  # 存储文件名作为描述
+                page_number=page_number,
+                file_path=page_path,
+                original_filename=filename,
+                ocr_status=OcrStatus.PENDING,
+            )
+            db.add(material)
+            db.flush()
+            results.append({
+                "filename": filename,
+                "success": True,
+                "material": material_to_response(material)
+            })
+        except Exception as e:
+            db.rollback()
+            results.append({"filename": filename, "success": False, "error": f"数据库错误: {str(e)}"})
+
+    db.commit()
+
+    return {
+        "imported": [r for r in results if r["success"]],
+        "failed": [r for r in results if not r["success"]],
+        "group_id": group_id,
+    }
+
+
+@router.post("/revert-import/{case_id}/{filename}")
+def revert_pdf_import(case_id: int, filename: str, db: Session = Depends(get_db)):
+    """
+    撤销 PDF 页面的导入（删除 Material 记录，保留文件）
+    """
+    material = db.query(Material).filter(
+        Material.case_id == case_id,
+        Material.file_path.like(f"%pdf_pages/{filename}")
+    ).first()
+
+    if not material:
+        raise HTTPException(404, "未找到该导入记录")
+
+    material_id = material.id
+    db.delete(material)
+    db.commit()
+
+    return {"ok": True, "material_id": material_id, "message": "已撤销导入，文件保留"}

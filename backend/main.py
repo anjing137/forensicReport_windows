@@ -91,6 +91,21 @@ app.include_router(settings.router)
 @app.on_event("startup")
 def startup():
     init_db()
+    # 自动修复：将孤立的 PROCESSING 状态重置为 PENDING（后端重启后残留的状态）
+    try:
+        from app.database import SessionLocal
+        from app.models.case import Material, OcrStatus
+        db = SessionLocal()
+        orphaned = db.query(Material).filter(Material.ocr_status == OcrStatus.PROCESSING).all()
+        if orphaned:
+            for m in orphaned:
+                m.ocr_status = OcrStatus.PENDING
+                m.ocr_text = ""
+            db.commit()
+            logger.info(f"启动修复：{len(orphaned)} 个 PROCESSING 材料已重置为 PENDING")
+        db.close()
+    except Exception as e:
+        logger.warning(f"启动修复 PROCESSING 状态时出错: {e}")
 
 
 # ==================== 前端静态文件托管 ====================
