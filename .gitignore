@@ -26,9 +26,6 @@ backend/paddle/
 # Generated reports
 backend/reports/
 
-# Compiled frontend (build artifacts)
-backend/static/
-
 # Frontend dev dependencies
 frontend/node_modules/
 frontend/dist/
